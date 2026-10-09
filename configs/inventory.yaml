@@ -1,0 +1,7 @@
+inventory:
+  service_levels: [0.90, 0.95, 0.98]
+  lead_time_days: 7
+  # Annual holding cost as a fraction of unit price.
+  holding_cost_rate: 0.25
+  # Lost-margin penalty per unit short, as a multiple of unit price.
+  stockout_cost_multiplier: 0.4

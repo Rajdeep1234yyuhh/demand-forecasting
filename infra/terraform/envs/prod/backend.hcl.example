@@ -1,0 +1,12 @@
+# Copy to backend.hcl (gitignored). Create the state bucket manually once, with versioning on.
+bucket                      = "df-terraform-state"
+key                         = "prod/terraform.tfstate"
+region                      = "ap-mumbai-1"
+endpoints                   = { s3 = "https://<namespace>.compat.objectstorage.ap-mumbai-1.oraclecloud.com" }
+use_path_style              = true
+skip_region_validation      = true
+skip_credentials_validation = true
+skip_requesting_account_id  = true
+skip_metadata_api_check     = true
+skip_s3_checksum            = true
+# Credentials: OCI Customer Secret Key via AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY env vars.
