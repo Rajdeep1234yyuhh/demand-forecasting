@@ -21,10 +21,24 @@ class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
+State = Literal["CA", "TX", "WI"]
+
+
 class DataConfig(_StrictModel):
+    root: Path = Path("data")
     raw_prefix: str
     processed_prefix: str
-    train_subset_state: str | None = None
+    ingest_state: State | None = None
+    train_subset_state: State | None = None
+    max_missing_price_ratio: float = Field(default=0.01, ge=0, le=1)
+
+    @property
+    def raw_dir(self) -> Path:
+        return self.root / self.raw_prefix
+
+    @property
+    def processed_dir(self) -> Path:
+        return self.root / self.processed_prefix
 
 
 class ForecastConfig(_StrictModel):

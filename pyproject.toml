@@ -5,13 +5,21 @@ description = "Retail demand forecasting and inventory optimization on the M5 da
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "pandera[polars]>=0.34",
+    "polars>=2.0,<3",
     "pydantic>=2.8",
     "pydantic-settings>=2.4",
     "pyyaml>=6.0",
     "structlog>=24.4",
 ]
 
+[project.scripts]
+df-ingest = "forecasting.data.ingest:main"
+
 [dependency-groups]
+data = [
+    "kaggle>=1.6",
+]
 dev = [
     "mypy>=1.11",
     "pre-commit>=3.8",
@@ -19,6 +27,13 @@ dev = [
     "pytest-cov>=5.0",
     "ruff>=0.6",
     "types-PyYAML>=6.0",
+]
+notebook = [
+    "ipykernel>=6.29",
+    "jupyterlab>=4.2",
+    "jupytext>=1.16",
+    "matplotlib>=3.9",
+    "nbconvert>=7.16",
 ]
 
 [build-system]

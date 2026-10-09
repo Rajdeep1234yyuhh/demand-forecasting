@@ -11,12 +11,12 @@ decisions, with the cost of stockouts and overstock quantified at different serv
 - **Simulated data arrival.** M5 is replayed day by day to exercise retraining and monitoring.
 - **Deployment.** Kubernetes on OCI Always Free, Neon Postgres, OCI Object Storage.
 
-See [ADR 0001](docs/adr/0001-platform-and-tooling.md) for platform decisions.
+Decisions: [ADR 0001](docs/adr/0001-platform-and-tooling.md) (platform), [ADR 0002](docs/adr/0002-data-layer.md) (data layer).
 
 ## Roadmap
 
 - [x] Phase 0: Foundations (tooling, config, CI, Terraform base)
-- [ ] Phase 1: Data ingestion, validation, EDA
+- [x] Phase 1: Data ingestion, validation, EDA
 - [ ] Phase 2: Baselines and backtesting
 - [ ] Phase 3: Statistical and LightGBM models, quantile forecasts
 - [ ] Phase 4: Inventory optimization and cost impact
@@ -34,6 +34,23 @@ cp .env.example .env
 make install   # dependencies + git hooks
 make check     # lint, type-check, tests
 ```
+
+## Data
+
+1. Create a Kaggle API token and save it as `~/.kaggle/kaggle.json`
+   (or set `KAGGLE_USERNAME` and `KAGGLE_KEY`).
+2. Accept the competition rules at
+   https://www.kaggle.com/competitions/m5-forecasting-accuracy/rules.
+3. Run:
+
+```bash
+make download-data   # raw CSVs into data/raw/m5
+make ingest          # validate and publish data/processed/m5 (add --state CA via df-ingest)
+make eda             # execute notebooks/01_eda.py into notebooks/01_eda.ipynb
+```
+
+Each ingestion writes `manifest.json` with source hashes, row counts, and a `data_version`.
+Full ingestion takes about a minute and peaks around 2.6 GB of memory.
 
 ## Layout
 

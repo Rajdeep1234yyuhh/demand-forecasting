@@ -1,11 +1,16 @@
 env: dev
 
 data:
+  root: data
   raw_prefix: raw/m5
   processed_prefix: processed/m5
+  # Restrict ingestion to one state (CA, TX, WI); null ingests all states.
+  ingest_state: null
   # In-cluster training runs on one state to fit the free-tier node budget.
   # Set to null for full-dataset training (run locally).
   train_subset_state: CA
+  # Fail ingestion if more than this share of positive-sales rows has no price.
+  max_missing_price_ratio: 0.01
 
 forecast:
   horizon_days: 28
