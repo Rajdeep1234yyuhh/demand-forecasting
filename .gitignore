@@ -10,7 +10,7 @@ dist/
 build/
 *.egg-info/
 .env
-data/
+/data/
 mlruns/
 *.parquet
 .ipynb_checkpoints/
