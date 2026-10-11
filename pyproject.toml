@@ -15,6 +15,7 @@ dependencies = [
 
 [project.scripts]
 df-ingest = "forecasting.data.ingest:main"
+df-backtest = "forecasting.evaluation.backtest:main"
 
 [dependency-groups]
 data = [

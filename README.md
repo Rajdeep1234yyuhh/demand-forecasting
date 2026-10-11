@@ -11,13 +11,13 @@ decisions, with the cost of stockouts and overstock quantified at different serv
 - **Simulated data arrival.** M5 is replayed day by day to exercise retraining and monitoring.
 - **Deployment.** Kubernetes on OCI Always Free, Neon Postgres, OCI Object Storage.
 
-Decisions: [ADR 0001](docs/adr/0001-platform-and-tooling.md) (platform), [ADR 0002](docs/adr/0002-data-layer.md) (data layer).
+Decisions: [ADR 0001](docs/adr/0001-platform-and-tooling.md) (platform), [ADR 0002](docs/adr/0002-data-layer.md) (data layer), [ADR 0003](docs/adr/0003-evaluation-and-baselines.md) (evaluation).
 
 ## Roadmap
 
 - [x] Phase 0: Foundations (tooling, config, CI, Terraform base)
 - [x] Phase 1: Data ingestion, validation, EDA
-- [ ] Phase 2: Baselines and backtesting
+- [x] Phase 2: Baselines and backtesting
 - [ ] Phase 3: Statistical and LightGBM models, quantile forecasts
 - [ ] Phase 4: Inventory optimization and cost impact
 - [ ] Phase 5: Airflow pipeline
@@ -51,6 +51,22 @@ make eda             # execute notebooks/01_eda.py into notebooks/01_eda.ipynb
 
 Each ingestion writes `manifest.json` with source hashes, row counts, and a `data_version`.
 Full ingestion takes about a minute and peaks around 2.6 GB of memory.
+
+## Evaluation
+
+```bash
+make backtest        # rolling-origin backtest of the baselines
+uv run df-backtest --state ALL --models seasonal_naive   # override scope or models
+```
+
+- **Metrics:** WRMSSE across all 12 M5 hierarchy levels (primary), WAPE, MASE, and bias.
+- **Folds:** three non-overlapping 28-day windows ending at the last day; the last one is the
+  M5 public-leaderboard window (days 1914-1941).
+- **Scope:** defaults to `data.train_subset_state` (CA); `--state ALL` uses every state.
+- **Output:** `reports/backtest/<data_version>/<timestamp>/` with `results.parquet` and a
+  `summary.md` that includes WRMSSE per hierarchy level.
+
+A full-scale backtest of three baselines takes about two minutes and peaks under 2 GB.
 
 ## Layout
 

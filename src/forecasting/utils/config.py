@@ -45,6 +45,8 @@ class ForecastConfig(_StrictModel):
     horizon_days: int = Field(gt=0)
     quantiles: tuple[float, ...]
     backtest_folds: int = Field(gt=0)
+    seasonal_period: int = Field(default=7, gt=0)
+    moving_average_window: int = Field(default=28, gt=0)
 
     @field_validator("quantiles")
     @classmethod
@@ -72,6 +74,7 @@ class InventoryConfig(_StrictModel):
 
 class AppConfig(_StrictModel):
     env: Literal["dev", "test", "prod"]
+    reports_dir: Path = Path("reports")
     data: DataConfig
     forecast: ForecastConfig
     inventory: InventoryConfig

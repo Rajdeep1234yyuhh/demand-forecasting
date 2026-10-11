@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help install lint format typecheck test check clean download-data ingest eda
+.PHONY: help install lint format typecheck test check clean download-data ingest eda backtest
 
 help: ## Show available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-12s %s\n", $$1, $$2}'
@@ -39,3 +39,6 @@ ingest: ## Validate raw data and publish processed Parquet
 
 eda: ## Execute the EDA notebook (writes notebooks/01_eda.ipynb)
 	uv run --group notebook jupytext --to ipynb --execute notebooks/01_eda.py
+
+backtest: ## Backtest baselines with rolling-origin folds (writes reports/backtest/...)
+	uv run df-backtest
