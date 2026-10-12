@@ -10,8 +10,10 @@ dist/
 build/
 *.egg-info/
 .env
-data/
-mlruns/
+# A leading slash anchors a pattern to the repository root; without it, data/ would also
+# hide the src/forecasting/data package.
+/data/
+/mlruns/
 *.parquet
 .ipynb_checkpoints/
 .terraform/
@@ -25,4 +27,4 @@ backend.hcl
 .vscode/
 
 # Generated reports
-reports/
+/reports/

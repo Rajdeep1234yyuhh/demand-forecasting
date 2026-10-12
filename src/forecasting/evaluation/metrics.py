@@ -1,4 +1,4 @@
-"""Point-forecast accuracy metrics over aligned ``actual`` and ``forecast`` columns."""
+"""Forecast accuracy metrics over aligned ``actual`` and forecast columns."""
 
 from __future__ import annotations
 
@@ -35,3 +35,19 @@ def bias(frame: pl.DataFrame) -> float:
     """
     _, error, actual = _totals(frame)
     return error / actual if actual else math.nan
+
+
+def pinball_loss(frame: pl.DataFrame, column: str, level: float) -> float:
+    """Mean pinball (quantile) loss of ``column`` as the ``level`` quantile of ``actual``.
+
+    Under-forecasts cost ``level`` per unit and over-forecasts ``1 - level``, so the loss is
+    minimised by the true quantile. Lower is better.
+    """
+    error = pl.col("actual") - pl.col(column)
+    loss = pl.max_horizontal(level * error, (level - 1) * error)
+    return float(frame.select(loss.mean()).item())
+
+
+def coverage(frame: pl.DataFrame, column: str) -> float:
+    """Share of actuals at or below ``column``. A calibrated quantile covers about its level."""
+    return float(frame.select((pl.col("actual") <= pl.col(column)).mean()).item())

@@ -20,3 +20,35 @@ forecast:
   # Baseline parameters.
   seasonal_period: 7
   moving_average_window: 28
+
+features:
+  # Sales lags in days. Each must be at least forecast.horizon_days, so every lag is
+  # already known on the forecast date and one model covers the whole horizon.
+  lags: [28, 35, 42, 49, 56]
+  # Windows for rolling mean and standard deviation of sales, shifted by the horizon.
+  rolling_windows: [7, 28, 56, 112]
+
+models:
+  lightgbm:
+    # Tweedie fits intermittent sales: many exact zeros plus a long right tail.
+    objective: tweedie
+    tweedie_variance_power: 1.1
+    learning_rate: 0.05
+    num_leaves: 127
+    min_data_in_leaf: 100
+    feature_fraction: 0.8
+    bagging_fraction: 0.8
+    bagging_freq: 1
+    lambda_l2: 0.1
+    num_boost_round: 300
+    # 0 uses every core. In Kubernetes, set it to the pod's CPU limit: OpenMP sees the
+    # node's cores, not the pod's, and would oversubscribe the CPU.
+    num_threads: 0
+    seed: 42
+  uncertainty:
+    # Recent days used to estimate how bursty each series is (negative binomial size).
+    window_days: 112
+
+tracking:
+  # MLflow experiment for backtests. Runs are logged only when DF_MLFLOW_TRACKING_URI is set.
+  experiment: demand-forecasting

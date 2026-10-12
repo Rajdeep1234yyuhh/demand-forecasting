@@ -10,10 +10,10 @@ from __future__ import annotations
 from collections.abc import Mapping
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -58,6 +58,56 @@ class ForecastConfig(_StrictModel):
         return tuple(sorted(set(value)))
 
 
+class FeatureConfig(_StrictModel):
+    lags: tuple[int, ...]
+    rolling_windows: tuple[int, ...]
+
+    @field_validator("lags", "rolling_windows")
+    @classmethod
+    def _validate_days(cls, value: tuple[int, ...]) -> tuple[int, ...]:
+        if not value:
+            raise ValueError("at least one value is required")
+        if any(days <= 0 for days in value):
+            raise ValueError("values must be positive numbers of days")
+        return tuple(sorted(set(value)))
+
+
+class LightGBMConfig(_StrictModel):
+    objective: Literal["tweedie", "poisson", "regression"]
+    tweedie_variance_power: float = Field(gt=1, lt=2)
+    learning_rate: float = Field(gt=0, le=1)
+    num_leaves: int = Field(ge=2)
+    min_data_in_leaf: int = Field(ge=1)
+    feature_fraction: float = Field(gt=0, le=1)
+    bagging_fraction: float = Field(gt=0, le=1)
+    bagging_freq: int = Field(ge=0)
+    lambda_l2: float = Field(ge=0)
+    num_boost_round: int = Field(gt=0)
+    num_threads: int = Field(ge=0)
+    seed: int
+
+    def training_params(self) -> dict[str, object]:
+        """LightGBM parameters, with settings that make training reproducible."""
+        params: dict[str, object] = self.model_dump(exclude={"num_boost_round"})
+        if self.objective != "tweedie":
+            del params["tweedie_variance_power"]
+        params.update(deterministic=True, force_row_wise=True, verbose=-1)
+        return params
+
+
+class UncertaintyConfig(_StrictModel):
+    window_days: int = Field(ge=2)
+
+
+class ModelsConfig(_StrictModel):
+    lightgbm: LightGBMConfig
+    uncertainty: UncertaintyConfig
+
+
+class TrackingConfig(_StrictModel):
+    experiment: str = Field(min_length=1)
+
+
 class InventoryConfig(_StrictModel):
     service_levels: tuple[float, ...]
     lead_time_days: int = Field(gt=0)
@@ -77,7 +127,22 @@ class AppConfig(_StrictModel):
     reports_dir: Path = Path("reports")
     data: DataConfig
     forecast: ForecastConfig
+    features: FeatureConfig
+    models: ModelsConfig
+    tracking: TrackingConfig
     inventory: InventoryConfig
+
+    @model_validator(mode="after")
+    def _lags_cover_horizon(self) -> Self:
+        """Reject lags shorter than the horizon: they would need sales not yet known."""
+        horizon = self.forecast.horizon_days
+        short = [lag for lag in self.features.lags if lag < horizon]
+        if short:
+            raise ValueError(
+                f"features.lags {short} are shorter than forecast.horizon_days ({horizon}); "
+                "those sales are not known yet on the forecast date"
+            )
+        return self
 
 
 class Secrets(BaseSettings):
@@ -90,6 +155,12 @@ class Secrets(BaseSettings):
     object_storage_access_key: SecretStr | None = None
     object_storage_secret_key: SecretStr | None = None
     mlflow_tracking_uri: str | None = None
+
+    @field_validator("*", mode="before")
+    @classmethod
+    def _empty_means_unset(cls, value: object) -> object:
+        """Treat ``DF_X=`` (set but empty) the same as not setting ``DF_X`` at all."""
+        return None if value == "" else value
 
 
 def deep_merge(base: Mapping[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:

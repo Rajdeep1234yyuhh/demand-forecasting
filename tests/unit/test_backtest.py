@@ -3,11 +3,12 @@ from pathlib import Path
 
 import polars as pl
 import pytest
+from mlflow.tracking import MlflowClient
 
-from forecasting.data.ingest import run_ingest
+from forecasting.data.dataset import Dataset
 from forecasting.data.schemas import DataValidationError
 from forecasting.evaluation.backtest import (
-    Dataset,
+    backtest_runs,
     main,
     make_folds,
     run_backtest,
@@ -16,8 +17,9 @@ from forecasting.evaluation.backtest import (
 )
 from forecasting.models.base import Forecaster
 from forecasting.models.baselines import MovingAverage, Naive, SeasonalNaive
-from forecasting.utils.config import DataConfig
-from tests.conftest import N_DAYS, START, M5Fixture
+from forecasting.models.uncertainty import NegativeBinomialUncertainty
+from forecasting.utils.config import get_secrets, load_config
+from tests.conftest import N_DAYS, START
 
 CONFIGS = Path(__file__).resolve().parents[2] / "configs"
 HORIZON = 3
@@ -54,18 +56,6 @@ class DropsASeries(Oracle):
     def _predict(self, cutoff: date, horizon: int) -> pl.DataFrame:
         forecasts = super()._predict(cutoff, horizon)
         return forecasts.filter(pl.col("id") != "FOODS_1_001_CA_1_evaluation")
-
-
-@pytest.fixture
-def ingested(m5: M5Fixture, data_config: DataConfig) -> Path:
-    m5.write(data_config.raw_dir)
-    run_ingest(data_config)
-    return data_config.processed_dir
-
-
-@pytest.fixture
-def dataset(ingested: Path) -> Dataset:
-    return Dataset.load(ingested)
 
 
 def test_make_folds() -> None:
@@ -151,6 +141,71 @@ def test_report(dataset: Dataset, tmp_path: Path) -> None:
     assert "| oracle | 0.0000 |" in summary
     assert "## WRMSSE by level" in summary
     assert summary.index("| oracle |") < summary.index("| naive |")
+    # No quantiles or feature importance were produced, so neither section appears.
+    assert "Quantile calibration" not in summary
+    assert "top features" not in summary
+
+
+def test_scores_quantiles(dataset: Dataset) -> None:
+    results = run_backtest(
+        dataset,
+        [Naive(), MovingAverage(window=7)],
+        horizon=HORIZON,
+        n_folds=FOLDS,
+        uncertainty=NegativeBinomialUncertainty(window_days=7),
+        levels=(0.5, 0.9),
+    )
+    for column in ("q_0.5", "q_0.9"):
+        assert results.get_column(f"coverage_{column}").is_between(0, 1).all()
+        assert (results.get_column(f"pinball_{column}") >= 0).all()
+    # A higher quantile can only cover more of the same actuals.
+    assert (results.get_column("coverage_q_0.9") >= results.get_column("coverage_q_0.5")).all()
+
+
+def test_uncertainty_requires_levels(dataset: Dataset) -> None:
+    with pytest.raises(ValueError, match="quantile levels"):
+        run_backtest(
+            dataset,
+            [Naive()],
+            horizon=HORIZON,
+            n_folds=FOLDS,
+            uncertainty=NegativeBinomialUncertainty(window_days=7),
+        )
+
+
+def test_report_calibration_and_importance(dataset: Dataset, tmp_path: Path) -> None:
+    results = run_backtest(
+        dataset,
+        [Naive()],
+        horizon=HORIZON,
+        n_folds=FOLDS,
+        uncertainty=NegativeBinomialUncertainty(window_days=7),
+        levels=(0.9,),
+    )
+    importance = pl.DataFrame(
+        {
+            "store_id": ["CA_1", "CA_1", "TX_1", "TX_1"],
+            "feature": ["lag_28", "snap", "lag_28", "snap"],
+            "gain": [3.0, 1.0, 1.0, 1.0],
+            "share": [0.75, 0.25, 0.5, 0.5],
+        }
+    )
+    run_dir = write_report(
+        results,
+        tmp_path,
+        data_version="abc123",
+        scope="CA",
+        horizon=HORIZON,
+        importance={"lightgbm": importance},
+    )
+    summary = (run_dir / "summary.md").read_text("utf-8")
+    assert "## Quantile calibration" in summary
+    assert "| Model | q_0.9 coverage | q_0.9 pinball |" in summary
+    assert "## lightgbm: top features, last fold" in summary
+    # Shares are averaged over stores: lag_28 (0.75 + 0.5) / 2, snap (0.25 + 0.5) / 2.
+    assert "| lag_28 | 62.5% |" in summary
+    assert summary.index("| lag_28 |") < summary.index("| snap | 37.5% |")
+    assert pl.read_parquet(run_dir / "feature_importance_lightgbm.parquet").equals(importance)
 
 
 def _cli_config(tmp_path: Path) -> list[str]:
@@ -172,7 +227,12 @@ def _summaries(tmp_path: Path) -> list[Path]:
 def test_cli_all_states(tmp_path: Path) -> None:
     assert main(["--config", *_cli_config(tmp_path), "--state", "ALL"]) == 0
     [summary] = _summaries(tmp_path)
-    assert "Scope: all states" in summary.read_text("utf-8")
+    text = summary.read_text("utf-8")
+    assert "Scope: all states" in text
+    # Every registered model ran, with quantiles, and LightGBM explained its features.
+    assert "| q_0.5 coverage | q_0.9 coverage | q_0.95 coverage |" in text
+    assert "## lightgbm: top features, last fold" in text
+    assert (summary.parent / "feature_importance_lightgbm.parquet").is_file()
 
 
 @pytest.mark.usefixtures("ingested")
@@ -185,3 +245,66 @@ def test_cli_defaults_to_training_subset(tmp_path: Path) -> None:
 
 def test_cli_failure_returns_nonzero(tmp_path: Path) -> None:
     assert main(["--config", *_cli_config(tmp_path)]) == 1
+
+
+def test_backtest_runs(dataset: Dataset, tmp_path: Path) -> None:
+    config = load_config(CONFIGS / "base.yaml", CONFIGS / "inventory.yaml")
+    results = run_backtest(
+        dataset,
+        [Naive(), SeasonalNaive(period=7)],
+        horizon=HORIZON,
+        n_folds=FOLDS,
+        uncertainty=NegativeBinomialUncertainty(window_days=7),
+        levels=(0.9,),
+    )
+    run_dir = write_report(results, tmp_path, data_version="abc123", scope="CA", horizon=HORIZON)
+    parent, children = backtest_runs(
+        results, config=config, data_version="abc123", scope="CA", run_dir=run_dir
+    )
+
+    assert parent.params["forecast.horizon_days"] == "28"
+    assert parent.tags["data_version"] == "abc123"
+    assert parent.tags["code_version"]
+    assert {path.name for path in parent.artifacts} == {"results.parquet", "summary.md"}
+    assert [child.name for child in children] == ["naive", "seasonal_naive"]
+
+    naive = children[0]
+    folds = results.filter(pl.col("model") == "naive")
+    assert naive.metrics["wrmsse"] == pytest.approx(folds.get_column("wrmsse").mean())
+    assert naive.metrics["coverage_q_0.9"] == pytest.approx(
+        folds.get_column("coverage_q_0.9").mean()
+    )
+    fold_wrmsse = [(step, value) for key, value, step in naive.step_metrics if key == "fold/wrmsse"]
+    assert fold_wrmsse == list(zip([1, 2], folds.sort("fold").get_column("wrmsse"), strict=True))
+    assert naive.params["model"] == "naive"
+
+
+def _use_tracking(monkeypatch: pytest.MonkeyPatch, uri: str) -> None:
+    monkeypatch.setenv("MLFLOW_ALLOW_FILE_STORE", "true")
+    monkeypatch.setenv("DF_MLFLOW_TRACKING_URI", uri)
+    get_secrets.cache_clear()
+
+
+@pytest.mark.usefixtures("ingested")
+def test_cli_logs_to_mlflow(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    uri = (tmp_path / "mlruns").as_uri()
+    _use_tracking(monkeypatch, uri)
+    assert main(["--config", *_cli_config(tmp_path), "--models", "naive", "tsb"]) == 0
+
+    client = MlflowClient(uri)
+    experiment = client.get_experiment_by_name("demand-forecasting")
+    assert experiment is not None
+    runs = client.search_runs([experiment.experiment_id])
+    parents = [run for run in runs if "mlflow.parentRunId" not in run.data.tags]
+    children = [run for run in runs if "mlflow.parentRunId" in run.data.tags]
+    assert [run.info.run_name for run in parents] == ["backtest CA"]
+    assert sorted(run.info.run_name for run in children) == ["naive", "tsb"]
+    assert all(run.info.status == "FINISHED" for run in runs)
+
+
+@pytest.mark.usefixtures("ingested")
+def test_cli_reports_tracking_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _use_tracking(monkeypatch, "unsupported-scheme://nowhere")
+    assert main(["--config", *_cli_config(tmp_path), "--models", "naive"]) == 1
+    # The backtest itself finished, so its report is still written.
+    assert len(_summaries(tmp_path)) == 1

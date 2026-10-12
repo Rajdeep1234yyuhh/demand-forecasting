@@ -10,20 +10,29 @@ from __future__ import annotations
 
 import argparse
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import polars as pl
+from mlflow.exceptions import MlflowException
 
-from forecasting.data.ingest import scan_sales
-from forecasting.data.manifest import Manifest
-from forecasting.data.schemas import STATES, STORES, DataValidationError
+from forecasting.data.dataset import Dataset
+from forecasting.data.schemas import STATES, DataValidationError
 from forecasting.evaluation.hierarchy import HIERARCHY_COLUMNS, LEVELS, HierarchicalEvaluator
-from forecasting.models.base import Forecaster
-from forecasting.models.baselines import BASELINES, make_baseline
-from forecasting.utils.config import load_config
+from forecasting.evaluation.metrics import coverage, pinball_loss
+from forecasting.models.base import ExplainsFeatures, Forecaster
+from forecasting.models.registry import MODEL_NAMES, make_model
+from forecasting.models.uncertainty import NegativeBinomialUncertainty, quantile_column
+from forecasting.tracking import (
+    MlflowTracker,
+    RunRecord,
+    code_version,
+    flatten_params,
+    log_nested,
+)
+from forecasting.utils.config import AppConfig, get_secrets, load_config
 from forecasting.utils.logging import configure_logging, get_logger
 
 log = get_logger(__name__)
@@ -53,37 +62,6 @@ def make_folds(last_date: date, horizon: int, n_folds: int) -> list[Fold]:
     return folds
 
 
-@dataclass(frozen=True)
-class Dataset:
-    """Processed data for one backtest, optionally restricted to a single state."""
-
-    sales: pl.LazyFrame
-    calendar: pl.DataFrame
-    prices: pl.LazyFrame
-    manifest: Manifest
-    state: str | None = None
-
-    @classmethod
-    def load(cls, processed_dir: Path, state: str | None = None) -> Dataset:
-        manifest_path = processed_dir / "manifest.json"
-        if not manifest_path.is_file():
-            raise FileNotFoundError(f"{manifest_path} not found. Run `make ingest`.")
-        sales = scan_sales(processed_dir)
-        prices = pl.scan_parquet(processed_dir / "prices.parquet")
-        if state is not None:
-            # Filtering on the partition column lets Polars skip other stores' files.
-            stores = [store for store in STORES if store.startswith(f"{state}_")]
-            sales = sales.filter(pl.col("store_id").is_in(stores))
-            prices = prices.filter(pl.col("store_id").is_in(stores))
-        return cls(
-            sales=sales,
-            calendar=pl.read_parquet(processed_dir / "calendar.parquet"),
-            prices=prices,
-            manifest=Manifest.model_validate_json(manifest_path.read_text("utf-8")),
-            state=state,
-        )
-
-
 def _align(actuals: pl.DataFrame, forecasts: pl.DataFrame, model: str) -> pl.DataFrame:
     """Join forecasts to actuals, failing if any series-day is missing or unexpected."""
     keys = ["id", "date"]
@@ -97,15 +75,41 @@ def _align(actuals: pl.DataFrame, forecasts: pl.DataFrame, model: str) -> pl.Dat
     return actuals.join(forecasts, on=keys, how="inner")
 
 
+def _quantile_metrics(
+    aligned: pl.DataFrame, uncertainty: NegativeBinomialUncertainty, levels: Sequence[float]
+) -> dict[str, float]:
+    """Coverage and pinball loss of each quantile level, at the bottom level."""
+    with_quantiles = uncertainty.quantiles(aligned, levels)
+    metrics: dict[str, float] = {}
+    for level in levels:
+        column = quantile_column(level)
+        metrics[f"coverage_{column}"] = coverage(with_quantiles, column)
+        metrics[f"pinball_{column}"] = pinball_loss(with_quantiles, column, level)
+    return metrics
+
+
 def run_backtest(
-    dataset: Dataset, models: Sequence[Forecaster], *, horizon: int, n_folds: int
+    dataset: Dataset,
+    models: Sequence[Forecaster],
+    *,
+    horizon: int,
+    n_folds: int,
+    uncertainty: NegativeBinomialUncertainty | None = None,
+    levels: Sequence[float] = (),
 ) -> pl.DataFrame:
-    """Return one row per fold and model, with every metric and fit-and-predict time."""
+    """Return one row per fold and model, with every metric and fit-and-predict time.
+
+    With ``uncertainty``, each model's point forecasts also become quantiles at ``levels``,
+    scored for coverage and pinball loss. Uncertainty is refitted on each fold's training
+    data, like the models.
+    """
     names = [model.name for model in models]
     if not names:
         raise ValueError("at least one model is required")
     if len(set(names)) != len(names):
         raise ValueError(f"model names must be unique, got {names}")
+    if uncertainty is not None and not levels:
+        raise ValueError("quantile levels are required when uncertainty is given")
 
     first, last = (
         dataset.sales.select(
@@ -139,6 +143,8 @@ def run_backtest(
         evaluator = HierarchicalEvaluator.from_history(
             train, dataset.calendar, dataset.prices, weight_days=horizon
         )
+        if uncertainty is not None:
+            uncertainty.fit(train)
         log.info(
             "backtest.fold",
             fold=fold.index,
@@ -150,16 +156,18 @@ def run_backtest(
             model_started = time.perf_counter()
             forecasts = model.fit(train).predict(horizon)
             seconds = time.perf_counter() - model_started
-            evaluation = evaluator.score(_align(actuals, forecasts, model.name))
-            rows.append(
-                {
-                    "fold": fold.index,
-                    "cutoff": fold.cutoff,
-                    "model": model.name,
-                    "seconds": seconds,
-                    **evaluation.as_row(),
-                }
-            )
+            aligned = _align(actuals, forecasts, model.name)
+            evaluation = evaluator.score(aligned)
+            row: dict[str, object] = {
+                "fold": fold.index,
+                "cutoff": fold.cutoff,
+                "model": model.name,
+                "seconds": seconds,
+                **evaluation.as_row(),
+            }
+            if uncertainty is not None:
+                row.update(_quantile_metrics(aligned, uncertainty, levels))
+            rows.append(row)
             log.info(
                 "backtest.model",
                 fold=fold.index,
@@ -185,8 +193,72 @@ def _markdown_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> li
     ]
 
 
-def render_summary(results: pl.DataFrame, *, data_version: str, scope: str, horizon: int) -> str:
-    """Markdown report: headline metrics per model and WRMSSE by hierarchy level."""
+def _calibration_section(results: pl.DataFrame, models: Sequence[str]) -> list[str]:
+    """Coverage and pinball loss per quantile, if the backtest scored quantiles."""
+    columns = sorted(
+        c.removeprefix("coverage_") for c in results.columns if c.startswith("coverage_")
+    )
+    if not columns:
+        return []
+    means = results.group_by("model").agg(
+        pl.col(f"{metric}_{column}").mean()
+        for metric in ("coverage", "pinball")
+        for column in columns
+    )
+    by_model = {row["model"]: row for row in means.iter_rows(named=True)}
+    return [
+        "",
+        "## Quantile calibration, bottom level, mean across folds",
+        "",
+        "A calibrated quantile covers about its level of actuals. Lower pinball loss is better.",
+        "",
+        *_markdown_table(
+            ["Model", *(f"{c} coverage" for c in columns), *(f"{c} pinball" for c in columns)],
+            [
+                [
+                    model,
+                    *(f"{by_model[model][f'coverage_{c}']:.1%}" for c in columns),
+                    *(f"{by_model[model][f'pinball_{c}']:.4f}" for c in columns),
+                ]
+                for model in models
+            ],
+        ),
+    ]
+
+
+def _importance_section(importance: Mapping[str, pl.DataFrame], top: int = 10) -> list[str]:
+    """Top features per model by share of gain, averaged over stores (last fold)."""
+    lines: list[str] = []
+    for model, frame in importance.items():
+        ranked = (
+            frame.group_by("feature")
+            .agg(pl.col("share").mean())
+            .sort("share", "feature", descending=[True, False])
+            .head(top)
+        )
+        lines += [
+            "",
+            f"## {model}: top features, last fold",
+            "",
+            "Share of total gain, averaged over stores.",
+            "",
+            *_markdown_table(
+                ["Feature", "Share"],
+                [[row["feature"], f"{row['share']:.1%}"] for row in ranked.iter_rows(named=True)],
+            ),
+        ]
+    return lines
+
+
+def render_summary(
+    results: pl.DataFrame,
+    *,
+    data_version: str,
+    scope: str,
+    horizon: int,
+    importance: Mapping[str, pl.DataFrame] | None = None,
+) -> str:
+    """Markdown report: headline metrics, WRMSSE by level, calibration, feature importance."""
     summary = summarize(results)
     models = summary.get_column("model").to_list()
     cutoffs = sorted(set(results.get_column("cutoff").to_list()))
@@ -228,21 +300,72 @@ def render_summary(results: pl.DataFrame, *, data_version: str, scope: str, hori
                 for level in LEVELS
             ],
         ),
+        *_calibration_section(results, models),
+        *_importance_section(importance or {}),
     ]
     return "\n".join(lines) + "\n"
 
 
 def write_report(
-    results: pl.DataFrame, reports_dir: Path, *, data_version: str, scope: str, horizon: int
+    results: pl.DataFrame,
+    reports_dir: Path,
+    *,
+    data_version: str,
+    scope: str,
+    horizon: int,
+    importance: Mapping[str, pl.DataFrame] | None = None,
 ) -> Path:
-    """Write results and a summary to a new, timestamped run directory."""
+    """Write results, feature importance, and a summary to a new, timestamped run directory."""
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
     run_dir = reports_dir / "backtest" / data_version / stamp
     run_dir.mkdir(parents=True)
     results.write_parquet(run_dir / "results.parquet")
-    summary = render_summary(results, data_version=data_version, scope=scope, horizon=horizon)
+    for model, frame in (importance or {}).items():
+        frame.write_parquet(run_dir / f"feature_importance_{model}.parquet")
+    summary = render_summary(
+        results, data_version=data_version, scope=scope, horizon=horizon, importance=importance
+    )
     (run_dir / "summary.md").write_text(summary, "utf-8")
     return run_dir
+
+
+def backtest_runs(
+    results: pl.DataFrame, *, config: AppConfig, data_version: str, scope: str, run_dir: Path
+) -> tuple[RunRecord, list[RunRecord]]:
+    """Tracking runs for one backtest: a parent with the report, one child per model.
+
+    Every run carries the full config, data version, and code version, so any number in
+    MLflow can be traced back and reproduced. Child metrics are means across folds, plus
+    each fold's value under ``fold/<metric>`` with the fold number as the step.
+    """
+    params = flatten_params(config.model_dump(mode="json"))
+    tags = {"kind": "backtest", "data_version": data_version, "scope": scope}
+    tags["code_version"] = code_version()
+    parent = RunRecord(
+        name=f"backtest {scope}",
+        params=params,
+        tags=tags,
+        artifacts=sorted(path for path in run_dir.iterdir() if path.is_file()),
+    )
+    metric_columns = [c for c in results.columns if c not in ("fold", "cutoff", "model")]
+    children = []
+    for model in sorted(set(results.get_column("model").to_list())):
+        folds = results.filter(pl.col("model") == model).sort("fold")
+        means = folds.select(pl.col(metric_columns).mean()).row(0, named=True)
+        children.append(
+            RunRecord(
+                name=model,
+                params={**params, "model": model},
+                metrics={key: float(value) for key, value in means.items()},
+                step_metrics=[
+                    (f"fold/{column}", float(row[column]), int(row["fold"]))
+                    for row in folds.iter_rows(named=True)
+                    for column in metric_columns
+                ],
+                tags={**tags, "model": model},
+            )
+        )
+    return parent, children
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -254,7 +377,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=[Path("configs/base.yaml"), Path("configs/inventory.yaml")],
         help="Config files, merged in order.",
     )
-    parser.add_argument("--models", nargs="+", choices=BASELINES, default=list(BASELINES))
+    parser.add_argument("--models", nargs="+", choices=MODEL_NAMES, default=list(MODEL_NAMES))
     parser.add_argument(
         "--state",
         choices=[*STATES, "ALL"],
@@ -271,25 +394,54 @@ def main(argv: Sequence[str] | None = None) -> int:
         state = None if args.state == "ALL" else args.state
     try:
         dataset = Dataset.load(config.data.processed_dir, state)
-        models = [make_baseline(name, config.forecast) for name in args.models]
+        models = [make_model(name, config, dataset) for name in args.models]
         results = run_backtest(
             dataset,
             models,
             horizon=config.forecast.horizon_days,
             n_folds=config.forecast.backtest_folds,
+            uncertainty=NegativeBinomialUncertainty(config.models.uncertainty.window_days),
+            levels=config.forecast.quantiles,
         )
     except (DataValidationError, FileNotFoundError, ValueError) as exc:
         log.error("backtest.failed", error=str(exc))
         return 1
 
+    importance = {
+        model.name: model.feature_importance()
+        for model in models
+        if isinstance(model, ExplainsFeatures)
+    }
     run_dir = write_report(
         results,
         config.reports_dir,
         data_version=dataset.manifest.data_version,
         scope=state or "all states",
         horizon=config.forecast.horizon_days,
+        importance=importance,
     )
     log.info("backtest.done", report=str(run_dir))
+
+    tracking_uri = get_secrets().mlflow_tracking_uri
+    if tracking_uri is None:
+        log.info("tracking.skipped", reason="DF_MLFLOW_TRACKING_URI is not set")
+        return 0
+    parent, children = backtest_runs(
+        results,
+        config=config,
+        data_version=dataset.manifest.data_version,
+        scope=state or "all states",
+        run_dir=run_dir,
+    )
+    try:
+        run_id = log_nested(
+            MlflowTracker(tracking_uri, config.tracking.experiment), parent, children
+        )
+    except (MlflowException, OSError) as exc:
+        # The report is already on disk, so nothing is lost; the run is marked failed.
+        log.error("tracking.failed", error=str(exc), report=str(run_dir))
+        return 1
+    log.info("tracking.done", run_id=run_id, experiment=config.tracking.experiment)
     return 0
 
 

@@ -60,3 +60,49 @@ def test_secrets_read_from_env_and_stay_masked(monkeypatch: pytest.MonkeyPatch) 
     assert secrets.database_url is not None
     assert secrets.database_url.get_secret_value() == "postgresql://u:p@h/db"
     assert "p@h" not in repr(secrets)
+
+
+def test_loads_feature_settings() -> None:
+    config = load_config(CONFIGS / "base.yaml", CONFIGS / "inventory.yaml")
+    assert config.features.lags == (28, 35, 42, 49, 56)
+    assert min(config.features.lags) >= config.forecast.horizon_days
+
+
+def test_rejects_lags_shorter_than_horizon(tmp_path: Path) -> None:
+    override = tmp_path / "lags.yaml"
+    override.write_text("features:\n  lags: [7, 28]\n", encoding="utf-8")
+    with pytest.raises(ValidationError, match=r"lags \[7\] are shorter"):
+        load_config(CONFIGS / "base.yaml", CONFIGS / "inventory.yaml", override)
+
+
+@pytest.mark.parametrize("bad", ["[]", "[0, 28]", "[-28]"])
+def test_rejects_invalid_feature_days(tmp_path: Path, bad: str) -> None:
+    override = tmp_path / "windows.yaml"
+    override.write_text(f"features:\n  rolling_windows: {bad}\n", encoding="utf-8")
+    with pytest.raises(ValidationError):
+        load_config(CONFIGS / "base.yaml", CONFIGS / "inventory.yaml", override)
+
+
+def test_lightgbm_training_params() -> None:
+    config = load_config(CONFIGS / "base.yaml", CONFIGS / "inventory.yaml")
+    params = config.models.lightgbm.training_params()
+    assert params["objective"] == "tweedie"
+    assert params["deterministic"] is True
+    assert "num_boost_round" not in params
+
+
+def test_tweedie_power_only_sent_for_tweedie(tmp_path: Path) -> None:
+    override = tmp_path / "poisson.yaml"
+    override.write_text("models:\n  lightgbm:\n    objective: poisson\n", encoding="utf-8")
+    config = load_config(CONFIGS / "base.yaml", CONFIGS / "inventory.yaml", override)
+    assert "tweedie_variance_power" not in config.models.lightgbm.training_params()
+
+
+def test_empty_secret_means_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DF_MLFLOW_TRACKING_URI", "")
+    assert Secrets(_env_file=None).mlflow_tracking_uri is None
+
+
+def test_loads_tracking_experiment() -> None:
+    config = load_config(CONFIGS / "base.yaml", CONFIGS / "inventory.yaml")
+    assert config.tracking.experiment == "demand-forecasting"

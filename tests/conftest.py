@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
@@ -9,7 +10,9 @@ from pathlib import Path
 import polars as pl
 import pytest
 
-from forecasting.utils.config import DataConfig
+from forecasting.data.dataset import Dataset
+from forecasting.data.ingest import run_ingest
+from forecasting.utils.config import DataConfig, get_secrets
 
 N_DAYS = 14
 START = date(2011, 1, 29)
@@ -116,6 +119,15 @@ def _prices() -> pl.DataFrame:
     )
 
 
+@pytest.fixture(autouse=True)
+def _no_tracking_server(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Keep tests hermetic: ignore any tracking server set in the shell or in .env."""
+    monkeypatch.setenv("DF_MLFLOW_TRACKING_URI", "")
+    get_secrets.cache_clear()
+    yield
+    get_secrets.cache_clear()
+
+
 @pytest.fixture
 def m5() -> M5Fixture:
     return M5Fixture(calendar=_calendar(), prices=_prices(), sales=_sales())
@@ -129,3 +141,16 @@ def data_config(tmp_path: Path) -> DataConfig:
         processed_prefix="processed/m5",
         max_missing_price_ratio=0.0,
     )
+
+
+@pytest.fixture
+def ingested(m5: M5Fixture, data_config: DataConfig) -> Path:
+    """Run ingestion on the fixture data and return the processed directory."""
+    m5.write(data_config.raw_dir)
+    run_ingest(data_config)
+    return data_config.processed_dir
+
+
+@pytest.fixture
+def dataset(ingested: Path) -> Dataset:
+    return Dataset.load(ingested)

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from datetime import date, timedelta
-from typing import ClassVar, Self
+from typing import ClassVar, Protocol, Self, runtime_checkable
 
 import pandera.polars as pa
 import polars as pl
@@ -76,3 +76,12 @@ class Forecaster(ABC):
 
     @abstractmethod
     def _predict(self, cutoff: date, horizon: int) -> pl.DataFrame: ...
+
+
+@runtime_checkable
+class ExplainsFeatures(Protocol):
+    """A fitted model that can report how much each feature contributed."""
+
+    def feature_importance(self) -> pl.DataFrame:
+        """Rows of ``store_id``, ``feature``, ``gain``, and ``share`` of gain per store."""
+        ...
